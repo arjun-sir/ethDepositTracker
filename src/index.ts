@@ -3,11 +3,13 @@ import { ethers } from "ethers";
 import logger from "./logger";
 import depositContractABI from "./DepositContractABI.json";
 import saveDepositData from "./saveData";
+import { Telegraf, Context } from "telegraf";
 
 dotenv.config();
 
 const provider = new ethers.JsonRpcProvider(process.env.ETH_RPC_URL);
 const depositContractAddress = process.env.DEPOSIT_CONTRACT_ADDRESS as string;
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN as string);
 
 console.log(`Using contract address: ${depositContractAddress}`);
 
@@ -17,11 +19,58 @@ const depositContract = new ethers.Contract(
     provider
 );
 
+let subscribedChatIds: Set<number> = new Set();
+
+bot.command("subscribe", (ctx: Context) => {
+    if ("chat" in ctx && "id" in ctx.chat!) {
+        subscribedChatIds.add(ctx.chat.id);
+        ctx.reply("You have successfully subscribed to deposit notifications.");
+    }
+});
+
+bot.command("unsubscribe", (ctx: Context) => {
+    if ("chat" in ctx && "id" in ctx.chat!) {
+        subscribedChatIds.delete(ctx.chat.id);
+        ctx.reply("You have unsubscribed from deposit notifications.");
+    }
+});
+
+async function sendTelegramMessage(message: string) {
+    try {
+        for (const chatId of subscribedChatIds) {
+            await bot.telegram.sendMessage(chatId, message);
+        }
+        console.log("Telegram messages sent successfully");
+    } catch (error) {
+        console.error("Error sending Telegram messages:", error);
+    }
+}
+
+async function saveDepositDataAndNotify(depositData: any) {
+    await saveDepositData(depositData);
+
+    const message =
+        `New deposit detected!\n` +
+        `Block: ${depositData.blockNumber}\n` +
+        `Timestamp: ${new Date(
+            depositData.blockTimestamp * 1000
+        ).toISOString()}\n` +
+        `Fee: ${depositData.fee} ETH\n` +
+        `Hash: ${depositData.hash}\n` +
+        `Pubkey: ${depositData.pubkey.slice(0, 10)}...`;
+
+    await sendTelegramMessage(message);
+}
+
 async function main() {
     try {
-        const latestBlock = await provider.getBlockNumber();
+        bot.launch();
+        console.log("Telegram bot started");
+
+        // Get the latest block when the application starts
+        let lastCheckedBlock = await provider.getBlockNumber();
         logger.info(
-            `Connected to provider. Latest block number: ${latestBlock}`
+            `Connected to provider. Latest block number: ${lastCheckedBlock}`
         );
 
         const code = await provider.getCode(depositContractAddress);
@@ -43,11 +92,41 @@ async function main() {
         );
         console.log("DepositEvent listener set up successfully");
 
-        // Periodic check
+        // Keep track of processed blocks to avoid logging duplicates
+        let lastProcessedBlock = lastCheckedBlock;
+
+        // Periodic check for new blocks
         setInterval(async () => {
-            const blockNumber = await provider.getBlockNumber();
-            console.log(`Still listening... Current block: ${blockNumber}`);
-        }, 60000);
+            const latestBlock = await provider.getBlockNumber();
+
+            // Only process new blocks (no duplicates)
+            if (latestBlock > lastProcessedBlock) {
+                console.log(`Current block: ${latestBlock}`);
+
+                // Check and process blocks between last checked and latest block
+                while (lastProcessedBlock < latestBlock) {
+                    lastProcessedBlock++;
+                    console.log(`Checking block: ${lastProcessedBlock}`);
+
+                    // Query past deposit events in this block
+                    const filter = depositContract.filters.DepositEvent();
+                    const events = await depositContract.queryFilter(
+                        filter,
+                        lastProcessedBlock - 1,
+                        lastProcessedBlock
+                    );
+
+                    console.log(
+                        `Found ${events.length} events in block ${lastProcessedBlock}`
+                    );
+
+                    // Process each deposit event
+                    for (const event of events) {
+                        await processDepositEvent(event as ethers.EventLog);
+                    }
+                }
+            }
+        }, 1000); // Adjust interval as needed
     } catch (error) {
         logger.error("Error in main function:", error);
     }
@@ -124,7 +203,7 @@ async function processDepositEvent(event: ethers.EventLog) {
         };
 
         console.log("Processing deposit:", depositData);
-        await saveDepositData(depositData);
+        await saveDepositDataAndNotify(depositData);
     } catch (error) {
         logger.error(
             `Error processing deposit at block ${event.blockNumber}:`,
