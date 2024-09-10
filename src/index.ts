@@ -112,7 +112,7 @@ async function main() {
                     const filter = depositContract.filters.DepositEvent();
                     const events = await depositContract.queryFilter(
                         filter,
-                        lastProcessedBlock - 1,
+                        lastProcessedBlock,
                         lastProcessedBlock
                     );
 
@@ -156,6 +156,12 @@ async function queryAndStorePastEvents() {
 
 async function processDepositEvent(event: ethers.EventLog) {
     try {
+        // Check if blockNumber is undefined
+        if (event.blockNumber === undefined) {
+            logger.warn(`Skipping event with undefined blockNumber`);
+            return; // Exit the function early
+        }
+
         const [
             pubkeyBytes,
             withdrawalCredentialsBytes,
@@ -184,10 +190,11 @@ async function processDepositEvent(event: ethers.EventLog) {
             return;
         }
 
-        if (!block || !transaction || !receipt) {
-            throw new Error(
-                "Could not fetch block, transaction, or receipt data"
+        if (!event.transactionHash || !receipt) {
+            logger.error(
+                `Missing required event data. BlockNumber: ${event.blockNumber}, Hash: ${event.transactionHash}`
             );
+            return; // Skip processing this event
         }
 
         const gasUsed = receipt.gasUsed;
